@@ -202,7 +202,7 @@ func checkDirectoryCompleteness(linkedDirs map[string]map[string]bool, ignoredFi
 }
 
 // printSummary outputs a detailed human-readable report of linked/ignored/missing files
-// Includes colors for quick scanning and a small joke for admins
+// Includes colors for quick scanning
 func printSummary(linkedDirs map[string]map[string]bool, ignoredFiles map[string]bool) {
 	fmt.Println("\n=== Summary of Linked/Ignored/Missing Files ===")
 	for dir, linkedFiles := range linkedDirs {
