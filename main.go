@@ -9,12 +9,12 @@ import (
 	"strings"
 )
 
-// Regex pattern to match lines starting with 'L' followed by
-// the symlink path and the target. This will ignore other lines.
+// lineRegex matches tmpfiles.d symlink lines (L, L?, L+)
+// capturing the path and the target while ignoring extra fields
 var (
-	lineRegex = regexp.MustCompile(`^L\s+([^\s]+)\s+[^\s]*\s+[^\s]*\s+[^\s]*\s+(.*)$`)
+	lineRegex = regexp.MustCompile(`^L[\?\+]*\s+([^\s]+)\s+[^\s]*\s+[^\s]*\s+[^\s]*\s+(.*)$`)
 
-	// ANSI color codes for nice terminal output
+	// ANSI color codes for human-readable logging
 	colorReset   = "\033[0m"
 	colorGreen   = "\033[32m"
 	colorYellow  = "\033[33m"
@@ -22,7 +22,8 @@ var (
 	colorBoldRed = "\033[1;31m"
 )
 
-// cleanQuotes trims spaces and any surrounding quotes from a string
+// cleanQuotes removes surrounding quotes and whitespace from a string
+// sometimes tmpfiles.d entries are quoted; we normalize them
 func cleanQuotes(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.Trim(s, `"`)
@@ -30,9 +31,8 @@ func cleanQuotes(s string) string {
 	return s
 }
 
-// factoryTarget returns the default "factory" target for a given path.
-// If the path is under /etc or /var, it maps to the corresponding factory path.
-// Otherwise, it prepends /usr/share/factory.
+// factoryTarget returns the "factory default" target for a given path
+// /etc and /var get special handling; everything else is under /usr/share/factory
 func factoryTarget(path string) string {
 	filename := filepath.Base(path)
 	if filename == "etc" || strings.HasPrefix(path, "/etc/") {
@@ -43,52 +43,89 @@ func factoryTarget(path string) string {
 	return "/usr/share/factory" + path
 }
 
-// processLine examines a single line from a tmpfiles.d configuration file.
-// If the target is empty or '-', it uses a factory default.
-// It checks if the target exists and logs appropriately.
-// Directories containing linked files are tracked in linkedDirs.
+// processLine handles L, L?, and L+ symlinks
+// - L  : normal, errors if target missing
+// - L? : optional, warns if target missing
+// - L+ : force recreate, errors if missing (can log note about recreation)
+// linkedDirs maps directories to filenames for later completeness checks
 func processLine(line string, linkedDirs map[string]map[string]bool) error {
+	if !strings.HasPrefix(line, "L") {
+		return nil // Not a symlink line; skip
+	}
+
+	// Determine prefix: normal, optional, or force recreate
+	prefix := line[:2]
+	targetOptional := false
+	recreate := false
+
+	switch prefix {
+	case "L?":
+		targetOptional = true
+	case "L+":
+		recreate = true
+	}
+
+	// Parse line using regex
 	matches := lineRegex.FindStringSubmatch(line)
 	if matches == nil {
-		return nil // Not a valid L line; skip
+		return nil // Line doesn't match expected L line format; skip
 	}
 
 	path := matches[1]
 	target := cleanQuotes(matches[2])
 
+	// Handle factory default if target is empty or "-"
 	if target == "" || target == "-" {
-		// Empty or "-" target: use factory default
 		ft := factoryTarget(path)
-		fmt.Printf("L %s -> (factory default: %s)\n", path, ft)
+		fmt.Printf("%s -> (factory default: %s)\n", path, ft)
 		if _, err := os.Stat(ft); err == nil {
 			fmt.Printf("  %s✓ Factory target exists: %s%s\n", colorGreen, ft, colorReset)
+		} else if targetOptional {
+			fmt.Printf("  %s⚠ Factory target missing (optional): %s%s\n", colorYellow, ft, colorReset)
 		} else {
 			fmt.Printf("  %s✗ Factory target missing: %s%s\n", colorRed, ft, colorReset)
 			return fmt.Errorf("missing factory target: %s", ft)
 		}
+		dir := filepath.Dir(ft)
+		if !isBaseDir(dir) {
+			// Track this file for completeness checks
+			if _, ok := linkedDirs[dir]; !ok {
+				linkedDirs[dir] = make(map[string]bool)
+			}
+			linkedDirs[dir][filepath.Base(ft)] = true
+		}
 	} else {
-		// Explicit target provided
-		fmt.Printf("L %s -> %s\n", path, target)
+		// Explicit target given
+		fmt.Printf("%s -> %s\n", path, target)
 		if _, err := os.Stat(target); err == nil {
 			fmt.Printf("  %s✓ Target exists: %s%s\n", colorGreen, target, colorReset)
 			dir := filepath.Dir(target)
 			if !isBaseDir(dir) {
-				// Track this directory and the linked file
 				if _, ok := linkedDirs[dir]; !ok {
 					linkedDirs[dir] = make(map[string]bool)
 				}
 				linkedDirs[dir][filepath.Base(target)] = true
 			}
+		} else if targetOptional {
+			// Optional symlinks: warn but don't error out
+			fmt.Printf("  %s⚠ Target missing (optional): %s%s\n", colorYellow, target, colorReset)
 		} else {
+			// Normal or L+ symlink: error if missing
 			fmt.Printf("  %s✗ Target missing: %s%s\n", colorRed, target, colorReset)
 			return fmt.Errorf("missing target: %s", target)
 		}
 	}
+
+	// If L+ (recreate), note it for admins
+	if recreate {
+		fmt.Printf("  %sNote: will recreate symlink if missing%s\n", colorYellow, colorReset)
+	}
+
 	return nil
 }
 
-// isBaseDir determines whether a directory is a "base" system directory.
-// Base dirs themselves are ignored for completeness checks, but subdirectories are tracked.
+// isBaseDir returns true if a directory is considered a base system dir
+// Base dirs themselves are ignored for completeness checks
 func isBaseDir(dir string) bool {
 	baseDirs := []string{"/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/lib64"}
 	for _, b := range baseDirs {
@@ -100,14 +137,11 @@ func isBaseDir(dir string) bool {
 }
 
 // loadIgnoreFiles reads all .ignore files under /usr/share/tmpfiles.d/
-// and returns a map of ignored file paths for quick lookup.
-// It also logs the ignored files in a human-readable way.
+// and returns a map of ignored file paths for quick lookup
+// Logs each ignored file in a human-readable way
 func loadIgnoreFiles() map[string]bool {
 	ignoredFiles := make(map[string]bool)
-	files, err := filepath.Glob("/usr/share/tmpfiles.d/*.ignore")
-	if err != nil {
-		return ignoredFiles
-	}
+	files, _ := filepath.Glob("/usr/share/tmpfiles.d/*.ignore")
 
 	for _, file := range files {
 		f, err := os.Open(file)
@@ -128,8 +162,8 @@ func loadIgnoreFiles() map[string]bool {
 	return ignoredFiles
 }
 
-// checkDirectoryCompleteness iterates through directories containing linked files.
-// It warns if there are files that should be linked but aren't, considering ignore rules.
+// checkDirectoryCompleteness ensures all files in tracked directories are either linked or ignored
+// Warns/errors if files are missing
 func checkDirectoryCompleteness(linkedDirs map[string]map[string]bool, ignoredFiles map[string]bool) error {
 	hadError := false
 	for dir, linkedFiles := range linkedDirs {
@@ -151,6 +185,7 @@ func checkDirectoryCompleteness(linkedDirs map[string]map[string]bool, ignoredFi
 				missing = append(missing, entry.Name())
 			}
 		}
+
 		if len(missing) > 0 {
 			fmt.Printf("%s✗ Error: Directory %s has symlinks in tmpfiles.d but not all files are linked.%s\n", colorRed, dir, colorReset)
 			fmt.Printf("   Missing files: %s%s%s\n", colorRed, strings.Join(missing, ", "), colorReset)
@@ -163,8 +198,8 @@ func checkDirectoryCompleteness(linkedDirs map[string]map[string]bool, ignoredFi
 	return nil
 }
 
-// printSummary gives a human-readable report of directories, showing:
-// linked files, ignored files, and missing files
+// printSummary outputs a detailed human-readable report of linked/ignored/missing files
+// Includes colors for quick scanning and a small joke for admins
 func printSummary(linkedDirs map[string]map[string]bool, ignoredFiles map[string]bool) {
 	fmt.Println("\n=== Summary of Linked/Ignored/Missing Files ===")
 	for dir, linkedFiles := range linkedDirs {
@@ -213,7 +248,7 @@ func printSummary(linkedDirs map[string]map[string]bool, ignoredFiles map[string
 }
 
 func main() {
-	// Find all tmpfiles.d configuration files
+	// Find all tmpfiles.d configuration files under /usr/lib/tmpfiles.d
 	files, err := filepath.Glob("/usr/lib/tmpfiles.d/*.conf")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error finding files: %v\n", err)
@@ -223,6 +258,7 @@ func main() {
 	exitCode := 0
 	linkedDirs := make(map[string]map[string]bool)
 
+	// Iterate over each configuration file
 	for _, file := range files {
 		f, err := os.Open(file)
 		if err != nil {
@@ -233,23 +269,22 @@ func main() {
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			// Only process lines starting with L (but not L? or L+)
-			if !strings.HasPrefix(line, "L") || strings.HasPrefix(line, "L?") || strings.HasPrefix(line, "L+") {
-				continue
-			}
-			if err := processLine(line, linkedDirs); err != nil {
-				exitCode = 1
+			// Only handle symlink lines (L, L?, L+)
+			if strings.HasPrefix(line, "L") {
+				if err := processLine(line, linkedDirs); err != nil {
+					exitCode = 1
+				}
 			}
 		}
 		f.Close()
 	}
 
 	ignoredFiles := loadIgnoreFiles()
+
 	if err := checkDirectoryCompleteness(linkedDirs, ignoredFiles); err != nil {
 		exitCode = 1
 	}
 
 	printSummary(linkedDirs, ignoredFiles)
-
 	os.Exit(exitCode)
 }
